@@ -3149,12 +3149,16 @@ make_thumbnail(char *file)
         /* for some formats, previous seek might over shoot pass this seek_target; is this a bug in libavcodec? */
         if (prevshot_pts > eff_target && 0 == evade_try) {
             // restart in seek mode of skipping shots (FIXME)
-            if ( seek_mode == 1 && 0 == gb_z_seek ) {
-              av_log(NULL, AV_LOG_INFO, "  *** previous seek overshot target %s; switching to non-seek mode\n", time_tmp);
-              av_seek_frame(pFormatCtx, video_index, 0, 0);
-              avcodec_flush_buffers(pCodecCtx);
-              seek_mode = 0;
-              goto restart;
+            int64_t overshoot = prevshot_pts - eff_target;
+            if (seek_mode == 1 && 0 == gb_z_seek 
+                && (overshoot > tn.step_t / 2)  // Only if overshoot is significant 
+                && (overshoot * tn.time_base > 20.0)) {  // Over 20 seconds off
+                av_log(NULL, AV_LOG_INFO, "  *** previous seek overshot target %s by %.2f s; switching to non-seek mode\n", 
+                    time_tmp, overshoot * tn.time_base);
+                av_seek_frame(pFormatCtx, video_index, 0, 0);
+                avcodec_flush_buffers(pCodecCtx);
+                seek_mode = 0;
+                goto restart;
             }
             av_log(NULL, AV_LOG_INFO, "  skipping shot at %s because of previous seek or evasions\n", time_tmp);
             idx--;
@@ -3211,8 +3215,9 @@ make_thumbnail(char *file)
         // if found frame is too far off from target, we'll disable seeking and start over
         if (idx < 5 && 1 == seek_mode && 0 == gb_z_seek
             // usually movies have key frames every 10 s
-            && (tn.step_t < (15/tn.time_base) || found_diff > 15/tn.time_base)
-            && (found_diff <= -tn.step_t || found_diff >= tn.step_t)) {
+            && (tn.step_t < (15/tn.time_base))  // Keep this check for small step sizes
+            && (found_diff <= -2*tn.step_t || found_diff >= 2*tn.step_t)  // Make threshold bigger
+            && (abs(found_diff * tn.time_base) > 30.0)) {  // Only if off by >30 seconds
 
             // compute the approx. time it take for the non-seek mode, if too long print a msg instead
             double shot_dtime;
