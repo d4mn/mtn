@@ -4109,6 +4109,36 @@ static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelF
 }
 
 /**
+ * Get the hardware pixel format for a given AVHWDeviceType.
+ * @param type The hardware device type (e.g., AV_HWDEVICE_TYPE_CUDA).
+ * @return The corresponding AVPixelFormat, or AV_PIX_FMT_NONE if unsupported.
+ */
+enum AVPixelFormat get_hw_pixel_format(enum AVHWDeviceType type) {
+    switch (type) {
+        case AV_HWDEVICE_TYPE_CUDA:
+            return AV_PIX_FMT_CUDA;
+        case AV_HWDEVICE_TYPE_VAAPI:
+            return AV_PIX_FMT_VAAPI;
+        case AV_HWDEVICE_TYPE_DXVA2:
+            return AV_PIX_FMT_DXVA2_VLD;
+        case AV_HWDEVICE_TYPE_VDPAU:
+            return AV_PIX_FMT_VDPAU;
+        case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
+            return AV_PIX_FMT_VIDEOTOOLBOX;
+        case AV_HWDEVICE_TYPE_D3D11VA:
+            return AV_PIX_FMT_D3D11;
+        case AV_HWDEVICE_TYPE_OPENCL:
+            return AV_PIX_FMT_OPENCL;
+        case AV_HWDEVICE_TYPE_VULKAN:
+            return AV_PIX_FMT_VULKAN;
+        default:
+            av_log(NULL, AV_LOG_ERROR, "Unsupported hardware device type: %s\n",
+                   av_hwdevice_get_type_name(type));
+            return AV_PIX_FMT_NONE;
+    }
+}
+
+/**
  * Initialize hardware acceleration for decoding.
  * @param pCodecCtx The AVCodecContext to configure.
  * @param preferred_type Preferred AVHWDeviceType (or AV_HWDEVICE_TYPE_NONE for auto).
