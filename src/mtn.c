@@ -2739,8 +2739,7 @@ make_thumbnail(char *file)
     }
 
         // Copy stream parameters
-    avcodec_parameters_to_context(pCodecCtx, pStream->codecpar);
-    dump_codec_context(pCodecCtx);
+    pCodecCtx = avcodec_alloc_context3(pCodec);
     // Initialize hardware acceleration (prefer CUDA, but auto-detect if NONE)
     int err = init_hardware_decoding(pCodecCtx, AV_HWDEVICE_TYPE_CUDA);
     if (err < 0) {
