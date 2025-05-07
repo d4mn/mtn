@@ -2008,104 +2008,90 @@ video_decode_next_frame(AVFormatContext *pFormatCtx,
 {
     assert(pFrame);
     assert(pPts);
+    assert(pFormatCtx);
+    assert(pCodecCtx);
 
-    AVPacket*   pkt;
-    AVStream*   pStream = pFormatCtx->streams[video_index];
-    int         fret;       //function return code
-    int         got_picture=0;
-    uint64_t    pkt_without_pic=0;
-    int         decoded_frame = 0;
+    static AVPacket *pkt = NULL;
+    AVStream *pStream = pFormatCtx->streams[video_index];
+    int got_picture = 0;
+    int ret = 0;
+    uint64_t pkt_without_pic = 0;
 
-    static int    run = 0;               // # of times read_and_decode has been called for a file
-    static double avg_decoded_frame = 0; // average # of decoded frame
-
-    pkt = av_packet_alloc();
-    if (!pkt)
-    {
-        av_log(NULL, AV_LOG_ERROR ,"Could not allocate packet\n");
-        return -1;
+    // Initialize packet on first call
+    if (!pkt) {
+        pkt = av_packet_alloc();
+        if (!pkt) {
+            av_log(NULL, AV_LOG_ERROR, "Could not allocate packet\n");
+            return AVERROR(ENOMEM);
+        }
+    } else {
+        av_packet_unref(pkt);
     }
 
-    while(got_picture == 0)
-    {
-        /// read packet
-        do
-        {
-            av_packet_unref(pkt);
-            fret = av_read_frame(pFormatCtx, pkt);
-            if(fret != 0)
-            {
-                av_log(NULL, AV_LOG_VERBOSE, "av_read_frame returned %d - considering as the end of file\n", fret);
-                av_log(NULL, AV_LOG_ERROR, "Error reading from video file\n");
-                return 0;
+    // Read and decode packets until a frame is obtained
+    while (!got_picture) {
+        // Read next packet
+        av_packet_unref(pkt);
+        ret = av_read_frame(pFormatCtx, pkt);
+        if (ret < 0) {
+            if (ret == AVERROR_EOF) {
+                // Flush decoder at EOF
+                ret = avcodec_send_packet(pCodecCtx, NULL);
+                if (ret < 0) {
+                    av_log(NULL, AV_LOG_ERROR, "Error flushing decoder: %s\n", av_err2str(ret));
+                    return ret;
+                }
+                ret = avcodec_receive_frame(pCodecCtx, pFrame);
+                if (ret == 0) {
+                    got_picture = 1;
+                    *pPts = pFrame->pts;
+                } else if (ret == AVERROR_EOF) {
+                    return 0; // End of file
+                } else {
+                    av_log(NULL, AV_LOG_ERROR, "Error receiving frame at EOF: %s\n", av_err2str(ret));
+                    return ret;
+                }
+            } else {
+                av_log(NULL, AV_LOG_ERROR, "Error reading packet: %s\n", av_err2str(ret));
+                return ret;
             }
-        } while(pkt->stream_index != video_index);
+        }
 
-        pkt_without_pic++;
-
-        dump_packet(pkt, pStream);
-
-        // Save global pts to be stored in pFrame in first call
-        av_log(NULL, AV_LOG_VERBOSE, "*saving gb_video_pkt_pts: %"PRId64"\n", pkt->pts);
-        gb_video_pkt_pts = pkt->pts;
-
-        /// try to decode packet
-        fret = get_frame_from_packet(pCodecCtx, pkt, pFrame);
-
-        // need more video packet(s)
-        if(fret == AVERROR(EAGAIN))
-        {
-            if(pkt_without_pic%50 == 0)
-                av_log(NULL, AV_LOG_INFO, "  no picture in %"PRId64" packets\n", pkt_without_pic);
-
-            if (pkt_without_pic >= MAX_PACKETS_WITHOUT_PICTURE) {
-                av_log(NULL, AV_LOG_ERROR, "  * av_read_frame couldn't decode picture in %d packets\n", MAX_PACKETS_WITHOUT_PICTURE);
-                av_packet_unref(pkt);
-                av_packet_free(&pkt);
-                return -1;
-            }
+        // Skip non-video packets
+        if (pkt->stream_index != video_index) {
             continue;
         }
 
-        /// decoded frame
-        if(fret == 0)
-        {
-            got_picture=1;
-            pkt_without_pic=0;
-            decoded_frame++;
+        pkt_without_pic++;
 
-            av_log(NULL, AV_LOG_VERBOSE, "*get_videoframe got frame: key_frame: %d, pict_type: %c\n",
-                           is_key_frame(pFrame), av_get_picture_type_char(pFrame->pict_type));
+        // Send packet to decoder
+        ret = avcodec_send_packet(pCodecCtx, pkt);
+        if (ret < 0) {
+            av_log(NULL, AV_LOG_ERROR, "Error sending packet to decoder: %s\n", av_err2str(ret));
+            return ret;
+        }
 
-            if (0 == decoded_frame%200) {
-                av_log(NULL, AV_LOG_INFO, "  picture not decoded in %d frames\n", decoded_frame);
+        // Receive decoded frame
+        ret = avcodec_receive_frame(pCodecCtx, pFrame);
+        if (ret == 0) {
+            got_picture = 1;
+            *pPts = pkt->pts; // Use packet PTS (or pFrame->pts if needed)
+        } else if (ret == AVERROR(EAGAIN)) {
+            if (pkt_without_pic >= 1000) { // Reduced MAX_PACKETS_WITHOUT_PICTURE for speed
+                av_log(NULL, AV_LOG_ERROR, "No picture after %d packets\n", 1000);
+                return AVERROR(EAGAIN);
             }
+            continue;
+        } else {
+            av_log(NULL, AV_LOG_ERROR, "Error receiving frame: %s\n", av_err2str(ret));
+            return ret;
         }
-        // error decoding packet
-        else
-        {
-            av_packet_unref(pkt);
-            av_packet_free(&pkt);
-            return -1;
-        }
-    }  // end of while
-
-    av_packet_unref(pkt);
-    av_packet_free(&pkt);
-
-    run++;
-    avg_decoded_frame = (avg_decoded_frame*(run-1) + decoded_frame) / run;
-
-
-    av_log(NULL, AV_LOG_VERBOSE, "*****got picture, repeat_pict: %d%s, key_frame: %d, pict_type: %c\n",
-        pFrame->repeat_pict,(pFrame->repeat_pict > 0) ? "**r**" : "", is_key_frame(pFrame), av_get_picture_type_char(pFrame->pict_type));
-
+    }
 
 
     dump_stream(pStream);
     dump_codec_context(pCodecCtx);
 
-    *pPts = gb_video_pkt_pts;
     return 1;
 }
 
@@ -2736,15 +2722,6 @@ make_thumbnail(char *file)
     if (pCodec == NULL) {
         av_log(NULL, AV_LOG_ERROR, "  couldn't find a decoder for codec_id: %d\n", pCodecCtx->codec_id);
         goto cleanup;
-    }
-
-        // Copy stream parameters
-    pCodecCtx = avcodec_alloc_context3(pCodec);
-    // Initialize hardware acceleration (prefer CUDA, but auto-detect if NONE)
-    int err = init_hardware_decoding(pCodecCtx, AV_HWDEVICE_TYPE_CUDA);
-    if (err < 0) {
-        avcodec_free_context(&pCodecCtx);
-        return err;
     }
 
     // discard frames; is this OK?? // FIXME
@@ -4075,205 +4052,6 @@ int get_double_opt(char c, double *opt, char *optarg, double sign)
         return 1;
     }
     *opt = ret;
-    return 0;
-}
-
-/**
- * Select the appropriate pixel format for hardware acceleration.
- * @param ctx The AVCodecContext.
- * @param pix_fmts List of supported pixel formats.
- * @return The selected pixel format or AV_PIX_FMT_NONE on failure.
- */
-static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
-    const enum AVPixelFormat *p;
-    AVHWFramesContext *frames_ctx = NULL;
-
-    if (ctx->hw_frames_ctx) {
-        frames_ctx = (AVHWFramesContext *)ctx->hw_frames_ctx->data;
-    }
-
-    for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
-        // Prefer the hardware format if frames context is available
-        if (frames_ctx && *p == frames_ctx->format) {
-            return *p;
-        }
-        // Fallback to a compatible software format if necessary
-        if (!frames_ctx && *p == ctx->sw_pix_fmt) {
-            return *p;
-        }
-    }
-
-    av_log(ctx, AV_LOG_ERROR, "No compatible hardware pixel format found\n");
-    return AV_PIX_FMT_NONE;
-}
-
-/**
- * Get the hardware pixel format for a given AVHWDeviceType.
- * @param type The hardware device type (e.g., AV_HWDEVICE_TYPE_CUDA).
- * @return The corresponding AVPixelFormat, or AV_PIX_FMT_NONE if unsupported.
- */
-enum AVPixelFormat get_hw_pixel_format(enum AVHWDeviceType type) {
-    switch (type) {
-        case AV_HWDEVICE_TYPE_CUDA:
-            return AV_PIX_FMT_CUDA;
-        case AV_HWDEVICE_TYPE_VAAPI:
-            return AV_PIX_FMT_VAAPI;
-        case AV_HWDEVICE_TYPE_DXVA2:
-            return AV_PIX_FMT_DXVA2_VLD;
-        case AV_HWDEVICE_TYPE_VDPAU:
-            return AV_PIX_FMT_VDPAU;
-        case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
-            return AV_PIX_FMT_VIDEOTOOLBOX;
-        case AV_HWDEVICE_TYPE_D3D11VA:
-            return AV_PIX_FMT_D3D11;
-        case AV_HWDEVICE_TYPE_OPENCL:
-            return AV_PIX_FMT_OPENCL;
-        case AV_HWDEVICE_TYPE_VULKAN:
-            return AV_PIX_FMT_VULKAN;
-        default:
-            av_log(NULL, AV_LOG_ERROR, "Unsupported hardware device type: %s\n",
-                   av_hwdevice_get_type_name(type));
-            return AV_PIX_FMT_NONE;
-    }
-}
-
-/**
- * Initialize hardware acceleration for decoding.
- * @param pCodecCtx The AVCodecContext to configure.
- * @param preferred_type Preferred AVHWDeviceType (or AV_HWDEVICE_TYPE_NONE for auto).
- * @return 0 on success, negative AVERROR code on failure.
- */
-int init_hardware_decoding(AVCodecContext *pCodecCtx, enum AVHWDeviceType preferred_type) {
-    enum AVHWDeviceType hw_type = AV_HWDEVICE_TYPE_NONE;
-    int err = 0;
-
-    if (!pCodecCtx || !pCodecCtx->codec) {
-        av_log(NULL, AV_LOG_ERROR, "Invalid codec context\n");
-        return AVERROR(EINVAL);
-    }
-
-    // Iterate over codec hardware configurations
-    for (int i = 0; ; i++) {
-        const AVCodecHWConfig *config = avcodec_get_hw_config(pCodecCtx->codec, i);
-        if (!config) {
-            break;
-        }
-        if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) {
-            // Verify system support for the hardware type
-            if (av_hwdevice_find_type_by_name(av_hwdevice_get_type_name(config->device_type))) {
-                hw_type = config->device_type;
-                // Prioritize preferred_type if specified and supported
-                if (preferred_type != AV_HWDEVICE_TYPE_NONE && preferred_type == hw_type) {
-                    break;
-                }
-                // Otherwise, keep the first supported type
-                if (preferred_type == AV_HWDEVICE_TYPE_NONE && hw_type != AV_HWDEVICE_TYPE_NONE) {
-                    break;
-                }
-            }
-        }
-    }
-    // Try hardware acceleration if a valid type was found
-    if (hw_type != AV_HWDEVICE_TYPE_NONE) {
-        av_log(NULL, AV_LOG_INFO, "Attempting hardware acceleration with %s\n",
-               av_hwdevice_get_type_name(hw_type));
-        err = hw_decoder_init(pCodecCtx, hw_type);
-        if (err >= 0) {
-            pCodecCtx->get_format = get_hw_format;
-            av_log(NULL, AV_LOG_INFO, "Using hardware acceleration: %s\n",
-                   av_hwdevice_get_type_name(hw_type));
-            return 0;
-        } else {
-            av_log(NULL, AV_LOG_WARNING, "Failed to initialize %s hardware acceleration: %s\n",
-                   av_hwdevice_get_type_name(hw_type), av_err2str(err));
-            // Reset context to avoid partial initialization
-            av_buffer_unref(&pCodecCtx->hw_device_ctx);
-            av_buffer_unref(&pCodecCtx->hw_frames_ctx);
-        }
-    } else {
-        av_log(NULL, AV_LOG_INFO, "No supported hardware acceleration found\n");
-    }
-
-    // Fallback to software decoding
-    av_log(NULL, AV_LOG_INFO, "Falling back to software decoding\n");
-    pCodecCtx->get_format = NULL; // Clear get_format for software decoding
-    return 0; // Return success to allow software decoding
-}
-
-// Function to initialize hardware decoder
-int hw_decoder_init(AVCodecContext *ctx, enum AVHWDeviceType type) {
-    AVBufferRef *hw_device_ctx = NULL;
-    AVBufferRef *hw_frames_ctx = NULL;
-    int err = 0;
-
-    // Validate codec and hardware type
-    if (!ctx || !ctx->codec) {
-        av_log(NULL, AV_LOG_ERROR, "Invalid codec context\n");
-        return AVERROR(EINVAL);
-    }
-
-    // Check if hardware type is supported
-    if (type == AV_HWDEVICE_TYPE_NONE || !av_hwdevice_find_type_by_name(av_hwdevice_get_type_name(type))) {
-        av_log(NULL, AV_LOG_ERROR, "Unsupported hardware type: %s\n", av_hwdevice_get_type_name(type));
-        return AVERROR(ENOSYS);
-    }
-
-    // Create hardware device context
-    err = av_hwdevice_ctx_create(&hw_device_ctx, type, NULL, NULL, 0);
-    if (err < 0) {
-        av_log(NULL, AV_LOG_ERROR, "Failed to create %s device context: %s\n",
-               av_hwdevice_get_type_name(type), av_err2str(err));
-        return err;
-    }
-
-    // Attach device context to codec context
-    ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
-    if (!ctx->hw_device_ctx) {
-        av_log(NULL, AV_LOG_ERROR, "Failed to reference hardware device context\n");
-        av_buffer_unref(&hw_device_ctx);
-        return AVERROR(ENOMEM);
-    }
-
-    // Initialize hardware frames context
-    hw_frames_ctx = av_hwframe_ctx_alloc(hw_device_ctx);
-    if (!hw_frames_ctx) {
-        av_log(NULL, AV_LOG_ERROR, "Failed to allocate hardware frames context\n");
-        av_buffer_unref(&hw_device_ctx);
-        return AVERROR(ENOMEM);
-    }
-
-    AVHWFramesContext *frames_ctx = (AVHWFramesContext *)hw_frames_ctx->data;
-    frames_ctx->format = get_hw_pixel_format(type); // Custom function to map type to format (e.g., AV_PIX_FMT_CUDA)
-    frames_ctx->sw_format = AV_PIX_FMT_NV12; // Default software format, adjust based on codec
-    frames_ctx->width = ctx->width;
-    frames_ctx->height = ctx->height;
-
-    err = av_hwframe_ctx_init(hw_frames_ctx);
-    if (err < 0) {
-        av_log(NULL, AV_LOG_ERROR, "Failed to initialize hardware frames context: %s\n", av_err2str(err));
-        av_buffer_unref(&hw_frames_ctx);
-        av_buffer_unref(&hw_device_ctx);
-        return err;
-    }
-
-    // Attach frames context to codec context
-    ctx->hw_frames_ctx = av_buffer_ref(hw_frames_ctx);
-    if (!ctx->hw_frames_ctx) {
-        av_log(NULL, AV_LOG_ERROR, "Failed to reference hardware frames context\n");
-        av_buffer_unref(&hw_frames_ctx);
-        av_buffer_unref(&hw_device_ctx);
-        return AVERROR(ENOMEM);
-    }
-
-    // Clean up temporary frames context
-    av_buffer_unref(&hw_frames_ctx);
-    av_buffer_unref(&hw_device_ctx);
-
-    // Set software pixel format
-    ctx->sw_pix_fmt = frames_ctx->sw_format;
-    av_log(NULL, AV_LOG_INFO, "Initialized %s hardware acceleration with sw_pix_fmt %s\n",
-           av_hwdevice_get_type_name(type), av_get_pix_fmt_name(ctx->sw_pix_fmt));
-
     return 0;
 }
 
