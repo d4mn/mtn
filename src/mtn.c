@@ -326,6 +326,8 @@ char **movie_ext = NULL;
 gdFTStringExtra fcStrFlagsInfotext = {0};
 gdFTStringExtra fcStrFlagsTimestamp = {0};
 
+AVBufferRef *hw_device_ctx = NULL;
+
 /* misc functions */
 
 KeyCounter* kc_new()
@@ -2735,7 +2737,48 @@ make_thumbnail(char *file)
         av_log(NULL, AV_LOG_ERROR, "  couldn't find a decoder for codec_id: %d\n", pCodecCtx->codec_id);
         goto cleanup;
     }
-//    const AVCodec *pCodec = pCodecCtx->codec;
+
+    // Try hardware acceleration
+    enum AVHWDeviceType hw_type = AV_HWDEVICE_TYPE_NONE;
+    for (int i = 0;; i++) {
+        const AVCodecHWConfig *config = avcodec_get_hw_config(pCodec, i);
+        if (!config) {
+            break;
+        }
+        if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) {
+            hw_type = config->device_type;
+            break;
+        }
+    }
+
+    // Function to get hardware supported formats
+    static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
+        const enum AVPixelFormat *p;
+        for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+            if (*p == ctx->hw_pix_fmt)
+                return *p;
+        }
+        av_log(NULL, AV_LOG_WARNING, "Failed to get HW surface format.\n");
+        return AV_PIX_FMT_NONE;
+    }
+
+    // Function to initialize hardware decoder
+    static int hw_decoder_init(AVCodecContext *ctx, enum AVHWDeviceType type) {
+        int err = 0;
+        if ((err = av_hwdevice_ctx_create(&hw_device_ctx, type, NULL, NULL, 0)) < 0) {
+            av_log(NULL, AV_LOG_ERROR, "Failed to create hardware device context.\n");
+            return err;
+        }
+        ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+        ctx->hw_pix_fmt = AV_PIX_FMT_CUDA;  // This should be determined dynamically but using CUDA as an example
+        return err;
+    }
+
+    if (hw_type != AV_HWDEVICE_TYPE_NONE && hw_decoder_init(pCodecCtx, hw_type) >= 0) {
+        pCodecCtx->get_format = get_hw_format;
+        av_log(NULL, AV_LOG_INFO, "Using hardware acceleration: %s\n", 
+               av_hwdevice_get_type_name(hw_type));
+    }
 
     // discard frames; is this OK?? // FIXME
     if (gb_s_step >= 0) {
@@ -4511,21 +4554,6 @@ int main(int argc, char *argv[])
         parse_error += 1;
         av_log(NULL, AV_LOG_ERROR, "%s: option --tonemap and --filters cant be used together", gb_argv0);
     }
-
-
-    /* gdFTUseFontConfig(1);  => no needed, using gdImageStringFTEx */
-	fcStrFlagsInfotext.flags  =
-	fcStrFlagsTimestamp.flags = gdFTEX_FONTPATHNAME | gdFTEX_RETURNFONTPATHNAME;
-
-	if (!strcmp(gb_f_fontname, GB_F_FONTNAME)) {
-		fcStrFlagsInfotext.flags |= gdFTEX_FONTCONFIG;
-		fcStrFlagsInfotext.flags &= ~gdFTEX_FONTPATHNAME;
-	}
-	if (!strcmp(gb_F_ts_fontname, GB_F_FONTNAME)) {
-		gb_F_ts_fontname = gb_f_fontname;
-
-		fcStrFlagsTimestamp = fcStrFlagsInfotext;
-	}
 
 
     if((movie_ext = strsplit(gb_e_ext, ",")) == NULL)
