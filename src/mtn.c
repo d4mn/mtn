@@ -2738,46 +2738,14 @@ make_thumbnail(char *file)
         goto cleanup;
     }
 
-    // Try hardware acceleration
-    enum AVHWDeviceType hw_type = AV_HWDEVICE_TYPE_NONE;
-    for (int i = 0;; i++) {
-        const AVCodecHWConfig *config = avcodec_get_hw_config(pCodec, i);
-        if (!config) {
-            break;
-        }
-        if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) {
-            hw_type = config->device_type;
-            break;
-        }
-    }
+        // Copy stream parameters
+    avcodec_parameters_to_context(pCodecCtx, pStream->codecpar);
 
-    // Function to get hardware supported formats
-    static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
-        const enum AVPixelFormat *p;
-        for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
-            if (*p == ctx->hw_pix_fmt)
-                return *p;
-        }
-        av_log(NULL, AV_LOG_WARNING, "Failed to get HW surface format.\n");
-        return AV_PIX_FMT_NONE;
-    }
-
-    // Function to initialize hardware decoder
-    static int hw_decoder_init(AVCodecContext *ctx, enum AVHWDeviceType type) {
-        int err = 0;
-        if ((err = av_hwdevice_ctx_create(&hw_device_ctx, type, NULL, NULL, 0)) < 0) {
-            av_log(NULL, AV_LOG_ERROR, "Failed to create hardware device context.\n");
-            return err;
-        }
-        ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
-        ctx->hw_pix_fmt = AV_PIX_FMT_CUDA;  // This should be determined dynamically but using CUDA as an example
+    // Initialize hardware acceleration (prefer CUDA, but auto-detect if NONE)
+    int err = init_hardware_decoding(pCodecCtx, AV_HWDEVICE_TYPE_CUDA);
+    if (err < 0) {
+        avcodec_free_context(&pCodecCtx);
         return err;
-    }
-
-    if (hw_type != AV_HWDEVICE_TYPE_NONE && hw_decoder_init(pCodecCtx, hw_type) >= 0) {
-        pCodecCtx->get_format = get_hw_format;
-        av_log(NULL, AV_LOG_INFO, "Using hardware acceleration: %s\n", 
-               av_hwdevice_get_type_name(hw_type));
     }
 
     // discard frames; is this OK?? // FIXME
@@ -4108,6 +4076,175 @@ int get_double_opt(char c, double *opt, char *optarg, double sign)
         return 1;
     }
     *opt = ret;
+    return 0;
+}
+
+/**
+ * Select the appropriate pixel format for hardware acceleration.
+ * @param ctx The AVCodecContext.
+ * @param pix_fmts List of supported pixel formats.
+ * @return The selected pixel format or AV_PIX_FMT_NONE on failure.
+ */
+static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
+    const enum AVPixelFormat *p;
+    AVHWFramesContext *frames_ctx = NULL;
+
+    if (ctx->hw_frames_ctx) {
+        frames_ctx = (AVHWFramesContext *)ctx->hw_frames_ctx->data;
+    }
+
+    for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+        // Prefer the hardware format if frames context is available
+        if (frames_ctx && *p == frames_ctx->format) {
+            return *p;
+        }
+        // Fallback to a compatible software format if necessary
+        if (!frames_ctx && *p == ctx->sw_pix_fmt) {
+            return *p;
+        }
+    }
+
+    av_log(ctx, AV_LOG_ERROR, "No compatible hardware pixel format found\n");
+    return AV_PIX_FMT_NONE;
+}
+
+/**
+ * Initialize hardware acceleration for decoding.
+ * @param pCodecCtx The AVCodecContext to configure.
+ * @param preferred_type Preferred AVHWDeviceType (or AV_HWDEVICE_TYPE_NONE for auto).
+ * @return 0 on success, negative AVERROR code on failure.
+ */
+int init_hardware_decoding(AVCodecContext *pCodecCtx, enum AVHWDeviceType preferred_type) {
+    enum AVHWDeviceType hw_type = AV_HWDEVICE_TYPE_NONE;
+    int err = 0;
+
+    if (!pCodecCtx || !pCodecCtx->codec) {
+        av_log(NULL, AV_LOG_ERROR, "Invalid codec context\n");
+        return AVERROR(EINVAL);
+    }
+
+    // Iterate over codec hardware configurations
+    for (int i = 0; ; i++) {
+        const AVCodecHWConfig *config = avcodec_get_hw_config(pCodecCtx->codec, i);
+        if (!config) {
+            break;
+        }
+        if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) {
+            // Verify system support for the hardware type
+            if (av_hwdevice_find_type_by_name(av_hwdevice_get_type_name(config->device_type))) {
+                hw_type = config->device_type;
+                // Prioritize preferred_type if specified and supported
+                if (preferred_type != AV_HWDEVICE_TYPE_NONE && preferred_type == hw_type) {
+                    break;
+                }
+                // Otherwise, keep the first supported type
+                if (preferred_type == AV_HWDEVICE_TYPE_NONE && hw_type != AV_HWDEVICE_TYPE_NONE) {
+                    break;
+                }
+            }
+        }
+    }
+    // Try hardware acceleration if a valid type was found
+    if (hw_type != AV_HWDEVICE_TYPE_NONE) {
+        av_log(NULL, AV_LOG_INFO, "Attempting hardware acceleration with %s\n",
+               av_hwdevice_get_type_name(hw_type));
+        err = hw_decoder_init(pCodecCtx, hw_type);
+        if (err >= 0) {
+            pCodecCtx->get_format = get_hw_format;
+            av_log(NULL, AV_LOG_INFO, "Using hardware acceleration: %s\n",
+                   av_hwdevice_get_type_name(hw_type));
+            return 0;
+        } else {
+            av_log(NULL, AV_LOG_WARNING, "Failed to initialize %s hardware acceleration: %s\n",
+                   av_hwdevice_get_type_name(hw_type), av_err2str(err));
+            // Reset context to avoid partial initialization
+            av_buffer_unref(&pCodecCtx->hw_device_ctx);
+            av_buffer_unref(&pCodecCtx->hw_frames_ctx);
+        }
+    } else {
+        av_log(NULL, AV_LOG_INFO, "No supported hardware acceleration found\n");
+    }
+
+    // Fallback to software decoding
+    av_log(NULL, AV_LOG_INFO, "Falling back to software decoding\n");
+    pCodecCtx->get_format = NULL; // Clear get_format for software decoding
+    return 0; // Return success to allow software decoding
+}
+
+// Function to initialize hardware decoder
+int hw_decoder_init(AVCodecContext *ctx, enum AVHWDeviceType type) {
+    AVBufferRef *hw_device_ctx = NULL;
+    AVBufferRef *hw_frames_ctx = NULL;
+    int err = 0;
+
+    // Validate codec and hardware type
+    if (!ctx || !ctx->codec) {
+        av_log(NULL, AV_LOG_ERROR, "Invalid codec context\n");
+        return AVERROR(EINVAL);
+    }
+
+    // Check if hardware type is supported
+    if (type == AV_HWDEVICE_TYPE_NONE || !av_hwdevice_find_type_by_name(av_hwdevice_get_type_name(type))) {
+        av_log(NULL, AV_LOG_ERROR, "Unsupported hardware type: %s\n", av_hwdevice_get_type_name(type));
+        return AVERROR(ENOSYS);
+    }
+
+    // Create hardware device context
+    err = av_hwdevice_ctx_create(&hw_device_ctx, type, NULL, NULL, 0);
+    if (err < 0) {
+        av_log(NULL, AV_LOG_ERROR, "Failed to create %s device context: %s\n",
+               av_hwdevice_get_type_name(type), av_err2str(err));
+        return err;
+    }
+
+    // Attach device context to codec context
+    ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+    if (!ctx->hw_device_ctx) {
+        av_log(NULL, AV_LOG_ERROR, "Failed to reference hardware device context\n");
+        av_buffer_unref(&hw_device_ctx);
+        return AVERROR(ENOMEM);
+    }
+
+    // Initialize hardware frames context
+    hw_frames_ctx = av_hwframe_ctx_alloc(hw_device_ctx);
+    if (!hw_frames_ctx) {
+        av_log(NULL, AV_LOG_ERROR, "Failed to allocate hardware frames context\n");
+        av_buffer_unref(&hw_device_ctx);
+        return AVERROR(ENOMEM);
+    }
+
+    AVHWFramesContext *frames_ctx = (AVHWFramesContext *)hw_frames_ctx->data;
+    frames_ctx->format = get_hw_pixel_format(type); // Custom function to map type to format (e.g., AV_PIX_FMT_CUDA)
+    frames_ctx->sw_format = AV_PIX_FMT_NV12; // Default software format, adjust based on codec
+    frames_ctx->width = ctx->width;
+    frames_ctx->height = ctx->height;
+
+    err = av_hwframe_ctx_init(hw_frames_ctx);
+    if (err < 0) {
+        av_log(NULL, AV_LOG_ERROR, "Failed to initialize hardware frames context: %s\n", av_err2str(err));
+        av_buffer_unref(&hw_frames_ctx);
+        av_buffer_unref(&hw_device_ctx);
+        return err;
+    }
+
+    // Attach frames context to codec context
+    ctx->hw_frames_ctx = av_buffer_ref(hw_frames_ctx);
+    if (!ctx->hw_frames_ctx) {
+        av_log(NULL, AV_LOG_ERROR, "Failed to reference hardware frames context\n");
+        av_buffer_unref(&hw_frames_ctx);
+        av_buffer_unref(&hw_device_ctx);
+        return AVERROR(ENOMEM);
+    }
+
+    // Clean up temporary frames context
+    av_buffer_unref(&hw_frames_ctx);
+    av_buffer_unref(&hw_device_ctx);
+
+    // Set software pixel format
+    ctx->sw_pix_fmt = frames_ctx->sw_format;
+    av_log(NULL, AV_LOG_INFO, "Initialized %s hardware acceleration with sw_pix_fmt %s\n",
+           av_hwdevice_get_type_name(type), av_get_pix_fmt_name(ctx->sw_pix_fmt));
+
     return 0;
 }
 
