@@ -2091,7 +2091,7 @@ video_decode_next_frame(AVFormatContext *pFormatCtx,
             }
             continue;  // Try next packet
         } else if (ret < 0 && ret != AVERROR(EAGAIN)) {
-            av_log(NULL, AV_LOG_ERROR, "Error sending packet to decoder: %s\n", av_err2str(ret));
+            av_log(NULL, AV_LOG_INFO, "Error sending packet to decoder: %s\n", av_err2str(ret));
             decode_errors++;
             
             if (decode_errors > max_decode_errors) {
