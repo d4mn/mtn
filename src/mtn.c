@@ -943,6 +943,10 @@ void FrameRGB_2_gdImage(AVFrame *pFrame, gdImagePtr ip, int width, int height)
 {
     uint8_t *src = pFrame->data[0];
     int x, y;
+    int linesize = pFrame->linesize[0];
+
+    av_log(NULL, AV_LOG_VERBOSE, "  FrameRGB_2_gdImage: width=%d, height=%d, linesize=%d\n", 
+        width, height, linesize);
     for (y = 0; y < height; y++) {
         for (x = 0; x < width * 3; x += 3) {
             gdImageSetPixel(ip, x / 3, y, gdImageColorResolve(ip, src[x], src[x + 1], src[x + 2]));
@@ -1951,13 +1955,18 @@ int get_frame_from_packet(AVCodecContext *pCodecCtx,
 
     // ignore invalid packets and continue
     if(fret == AVERROR_INVALIDDATA ||
-       fret == -1 /* Operation not permitted */
-    )
+       fret == -1 /* Operation not permitted */ ||
+       fret == AVERROR(EINVAL)) // Added EINVAL to handle invalid cu_qp_delta
+    {
+        av_log(NULL, AV_LOG_WARNING, "Invalid packet data (error %d: %s) - skipping packet\n", 
+               fret, av_err2str(fret));
         return AVERROR(EAGAIN);
+    }
 
     if (fret < 0) {
-        av_log(NULL, AV_LOG_ERROR,  "Error sending a packet for decoding - %s\n", get_error_text(fret));
-        exit(EXIT_ERROR);
+        av_log(NULL, AV_LOG_ERROR, "Error sending a packet for decoding - %s\n", get_error_text(fret));
+        // Don't exit with error, just return the error code for higher-level handling
+        return fret;
     }
 
     fret = avcodec_receive_frame(pCodecCtx, pFrame);
@@ -1967,17 +1976,18 @@ int get_frame_from_packet(AVCodecContext *pCodecCtx,
 
     if(fret == AVERROR_EOF)
     {
-        av_log(NULL, AV_LOG_ERROR, "No more frames: recieved AVERROR_EOF\n");
+        av_log(NULL, AV_LOG_INFO, "No more frames: received AVERROR_EOF\n");
         return -1;
     }
     if (fret == AVERROR(EINVAL))
     {
-        av_log(NULL, AV_LOG_ERROR, "Codec not opened: recieved AVERROR(EINVAL)\n");
+        av_log(NULL, AV_LOG_WARNING, "Codec not opened or invalid parameters: received AVERROR(EINVAL)\n");
         return -1;
     }
     if (fret < 0) {
-        av_log(NULL, AV_LOG_ERROR, "Error during decoding packet\n");
-        exit(EXIT_ERROR);
+        av_log(NULL, AV_LOG_WARNING, "Error during decoding packet: %s\n", av_err2str(fret));
+        // Return error instead of exiting to allow continued processing
+        return fret;
     }
 #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(55, 34, 100)
     av_log(NULL, AV_LOG_VERBOSE, "Got picture from frame pts=%"PRId64"\n", pFrame->pts);
@@ -2016,6 +2026,8 @@ video_decode_next_frame(AVFormatContext *pFormatCtx,
     int got_picture = 0;
     int ret = 0;
     uint64_t pkt_without_pic = 0;
+    int decode_errors = 0;
+    const int max_decode_errors = 5;  // Allow multiple errors before giving up
 
     // Initialize packet on first call
     if (!pkt) {
@@ -2035,24 +2047,18 @@ video_decode_next_frame(AVFormatContext *pFormatCtx,
         ret = av_read_frame(pFormatCtx, pkt);
         if (ret < 0) {
             if (ret == AVERROR_EOF) {
-                // Flush decoder at EOF
-                ret = avcodec_send_packet(pCodecCtx, NULL);
-                if (ret < 0) {
-                    av_log(NULL, AV_LOG_ERROR, "Error flushing decoder: %s\n", av_err2str(ret));
-                    return ret;
-                }
+                av_log(NULL, AV_LOG_VERBOSE, "av_read_frame returned EOF - end of file\n");
+                // Flush decoder at EOF to try to get the last frame
+                avcodec_send_packet(pCodecCtx, NULL);
                 ret = avcodec_receive_frame(pCodecCtx, pFrame);
                 if (ret == 0) {
                     got_picture = 1;
-                    *pPts = pFrame->pts;
-                } else if (ret == AVERROR_EOF) {
-                    return 0; // End of file
-                } else {
-                    av_log(NULL, AV_LOG_ERROR, "Error receiving frame at EOF: %s\n", av_err2str(ret));
-                    return ret;
+                    *pPts = pFrame->pts != AV_NOPTS_VALUE ? pFrame->pts : pFrame->pkt_dts;
+                    break;
                 }
+                return 0;  // EOF with no more frames
             } else {
-                av_log(NULL, AV_LOG_ERROR, "Error reading packet: %s\n", av_err2str(ret));
+                av_log(NULL, AV_LOG_ERROR, "Error reading frame: %s\n", av_err2str(ret));
                 return ret;
             }
         }
@@ -2064,30 +2070,66 @@ video_decode_next_frame(AVFormatContext *pFormatCtx,
 
         pkt_without_pic++;
 
-        // Send packet to decoder
+        dump_packet(pkt, pStream);
+
+        // Save global pts to be stored in pFrame
+        av_log(NULL, AV_LOG_VERBOSE, "*saving gb_video_pkt_pts: %"PRId64"\n", pkt->pts);
+        gb_video_pkt_pts = pkt->pts;
+
+        // Try to decode packet
         ret = avcodec_send_packet(pCodecCtx, pkt);
-        if (ret < 0) {
+        
+        // Handle decode errors more gracefully
+        if (ret == AVERROR_INVALIDDATA) {
+            decode_errors++;
+            av_log(NULL, AV_LOG_WARNING, "Invalid data in packet at pts %"PRId64" (%s) - skipping\n", 
+                   pkt->pts, av_err2str(ret));
+            
+            if (decode_errors > max_decode_errors) {
+                av_log(NULL, AV_LOG_ERROR, "Too many decode errors (%d) - giving up\n", decode_errors);
+                return ret;
+            }
+            continue;  // Try next packet
+        } else if (ret < 0 && ret != AVERROR(EAGAIN)) {
             av_log(NULL, AV_LOG_ERROR, "Error sending packet to decoder: %s\n", av_err2str(ret));
-            return ret;
+            decode_errors++;
+            
+            if (decode_errors > max_decode_errors) {
+                av_log(NULL, AV_LOG_ERROR, "Too many decode errors (%d) - giving up\n", decode_errors);
+                return ret;
+            }
+            continue;  // Try next packet
         }
 
         // Receive decoded frame
         ret = avcodec_receive_frame(pCodecCtx, pFrame);
-        if (ret == 0) {
-            got_picture = 1;
-            *pPts = pkt->pts; // Use packet PTS (or pFrame->pts if needed)
-        } else if (ret == AVERROR(EAGAIN)) {
-            if (pkt_without_pic >= 1000) { // Reduced MAX_PACKETS_WITHOUT_PICTURE for speed
-                av_log(NULL, AV_LOG_ERROR, "No picture after %d packets\n", 1000);
+        
+        if (ret == AVERROR(EAGAIN)) {
+            // Need more packets
+            if (pkt_without_pic % 50 == 0)
+                av_log(NULL, AV_LOG_INFO, "  no picture in %"PRId64" packets\n", pkt_without_pic);
+            
+            if (pkt_without_pic >= MAX_PACKETS_WITHOUT_PICTURE) {
+                av_log(NULL, AV_LOG_ERROR, "  giving up after %"PRId64" packets without a picture\n", pkt_without_pic);
                 return AVERROR(EAGAIN);
             }
             continue;
-        } else {
-            av_log(NULL, AV_LOG_ERROR, "Error receiving frame: %s\n", av_err2str(ret));
-            return ret;
+        } else if (ret < 0) {
+            // Error during frame decoding
+            decode_errors++;
+            av_log(NULL, AV_LOG_WARNING, "Error receiving frame: %s - skipping\n", av_err2str(ret));
+            
+            if (decode_errors > max_decode_errors) {
+                av_log(NULL, AV_LOG_ERROR, "Too many decode errors (%d) - giving up\n", decode_errors);
+                return ret;
+            }
+            continue;  // Try next packet
         }
+        
+        // Successfully decoded a frame
+        got_picture = 1;
+        *pPts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
     }
-
 
     dump_stream(pStream);
     dump_codec_context(pCodecCtx);
@@ -2192,6 +2234,8 @@ int really_seek(AVFormatContext *pFormatCtx, int index, int64_t timestamp, int f
 {
     assert(flags == 0 || flags == AVSEEK_FLAG_BACKWARD);
     int ret;
+    int retry_count = 0;
+    const int max_retries = 3;
 
     /* first try av_seek_frame */
     ret = av_seek_frame(pFormatCtx, index, timestamp, flags);
@@ -2223,11 +2267,27 @@ int really_seek(AVFormatContext *pFormatCtx, int index, int64_t timestamp, int f
     if (file_size <= 0) {
         return -1;
     }
+    
     if (duration > 0) {
         int64_t duration_tb = duration / av_q2d(pStream->time_base); // in time_base unit
         int64_t byte_pos = av_rescale(timestamp, file_size, duration_tb);
         av_log(NULL, AV_LOG_INFO, "AVSEEK_FLAG_BYTE: byte_pos: %"PRId64", timestamp: %"PRId64", file_size: %"PRId64", duration_tb: %"PRId64"\n", byte_pos, timestamp, file_size, duration_tb);
-        return av_seek_frame(pFormatCtx, index, byte_pos, AVSEEK_FLAG_BYTE);
+        ret = av_seek_frame(pFormatCtx, index, byte_pos, AVSEEK_FLAG_BYTE);
+        
+        // If byte seeking failed, try with slightly adjusted positions
+        while (ret < 0 && retry_count < max_retries) {
+            retry_count++;
+            // Try with a slightly different byte position
+            byte_pos += (retry_count % 2 == 0) ? (1024 * retry_count) : (-1024 * retry_count);
+            if (byte_pos < 0) byte_pos = 0;
+            if (byte_pos >= file_size) byte_pos = file_size - 1024;
+            
+            av_log(NULL, AV_LOG_INFO, "Retry %d: AVSEEK_FLAG_BYTE: byte_pos: %"PRId64"\n", 
+                   retry_count, byte_pos);
+            ret = av_seek_frame(pFormatCtx, index, byte_pos, AVSEEK_FLAG_BYTE);
+        }
+        
+        return ret;
     }
 
     return -1;
@@ -2446,6 +2506,12 @@ calculate_thumbnail(
     tn->shot_height_out = floor((double) src_height / src_width * tn->shot_width_out + 0.5); // round nearest
     tn->shot_height_out -= tn->shot_height_out%2; // floor to even number
     tn->center_gap = (tn->img_width - gb_g_gap*(tn->column+1) - tn->shot_width_out * tn->column) / 2.0;
+
+    av_log(NULL, AV_LOG_INFO, "  Thumbnail dimensions calculation:\n");
+    av_log(NULL, AV_LOG_INFO, "    Source: %dx%d, Output shot: %dx%d\n", 
+           src_width, src_height, tn->shot_width_out, tn->shot_height_out);
+    av_log(NULL, AV_LOG_INFO, "    Aspect ratio calculation: %d/%d = %.3f\n",
+           src_height, src_width, (double)src_height/src_width);
 }
 
 void
@@ -3188,9 +3254,26 @@ make_thumbnail(char *file)
             if (0 == ret) { // end of file
                 /*goto cleanup;         stops and writes no image */
                 goto eof;               // write into image everything we have so far
-            } else if (ret < 0) { // error
-                av_log(NULL, AV_LOG_ERROR, "  read&decode failed!\n");
-                goto eof;
+            } else if (ret < 0 || (found_pts == -1 && evade_try > 3)) {
+                // Try seeking to slightly different position
+                int64_t alt_target = eff_target + (evade_try * (pStream->time_base.den / pStream->time_base.num / 2));
+                av_log(NULL, AV_LOG_INFO, "  seeking to alternative position %.2f s\n", 
+                       calc_time(alt_target, pStream->time_base, start_time));
+                
+                ret = av_seek_frame(pFormatCtx, video_index, alt_target, AVSEEK_FLAG_ANY);
+                if (ret < 0) {
+                    av_log(NULL, AV_LOG_WARNING, "  alternative seeking to %.2f s also failed\n", 
+                           calc_time(alt_target, pStream->time_base, start_time));
+                    // Skip this shot rather than failing completely
+                    goto skip_shot;
+                }
+                
+                avcodec_flush_buffers(pCodecCtx);
+                ret = video_decode_next_frame(pFormatCtx, pCodecCtx, pFrame, video_index, &found_pts);
+                if (ret <= 0) {
+                    av_log(NULL, AV_LOG_WARNING, "  still cannot decode frame after alternative seek - skipping shot\n");
+                    goto skip_shot;
+                }
             }
         } else { // non-seek mode -- we keep decoding until we get to the next shot
             found_pts = 0;
@@ -3199,10 +3282,27 @@ make_thumbnail(char *file)
                 ret =  video_decode_next_frame(pFormatCtx, pCodecCtx, pFrame, video_index, &found_pts);
                 if (0 == ret) { // end of file
                     goto eof;
-                } else if (ret < 0) { // error
-                    av_log(NULL, AV_LOG_ERROR, "  read&decode failed!\n");
-                    goto eof;
+                } else if (ret < 0 || (found_pts == -1 && evade_try > 3)) {
+                // Try seeking to slightly different position
+                int64_t alt_target = eff_target + (evade_try * (pStream->time_base.den / pStream->time_base.num / 2));
+                av_log(NULL, AV_LOG_INFO, "  seeking to alternative position %.2f s\n", 
+                       calc_time(alt_target, pStream->time_base, start_time));
+                
+                ret = av_seek_frame(pFormatCtx, video_index, alt_target, AVSEEK_FLAG_ANY);
+                if (ret < 0) {
+                    av_log(NULL, AV_LOG_WARNING, "  alternative seeking to %.2f s also failed\n", 
+                           calc_time(alt_target, pStream->time_base, start_time));
+                    // Skip this shot rather than failing completely
+                    goto skip_shot;
                 }
+                
+                avcodec_flush_buffers(pCodecCtx);
+                ret = video_decode_next_frame(pFormatCtx, pCodecCtx, pFrame, video_index, &found_pts);
+                if (ret <= 0) {
+                    av_log(NULL, AV_LOG_WARNING, "  still cannot decode frame after alternative seek - skipping shot\n");
+                    goto skip_shot;
+                }
+            }
             }
         }
         //struct timeval dfinish; // DEBUG
@@ -3328,7 +3428,15 @@ make_thumbnail(char *file)
         if(height_of_the_output_slice <= 0)
         {
             av_log(NULL, AV_LOG_ERROR, "  sws_scale() failed here\n");
-            goto cleanup;
+            // Don't abort, try to recover with next frame
+            evade_try++;
+            if (evade_try < 5) {
+                av_log(NULL, AV_LOG_INFO, "  trying again with different frame (attempt %d)\n", evade_try);
+                goto continue_cleanup;
+            } else {
+                av_log(NULL, AV_LOG_ERROR, "  giving up after %d attempts\n", evade_try);
+                goto skip_shot;
+            }
         }
         /*
         sprintf(debug_filename, "%s_resized%05d.jpg", tn.out_filename, nb_shots - 1); // DEBUG
@@ -3336,9 +3444,7 @@ make_thumbnail(char *file)
             debug_filename, tn.shot_width, tn.shot_height);
         */
 
-        /* if blank screen, try again */
-        // FIXME: make sure this'll work when step is small
-        // FIXME: make sure each shot wont get repeated
+        /* if blank screen or decoding error, try again */
         double blank = blank_frame(pFrameRGB, tn.shot_width_out, tn.shot_height_out);
         // only do edge when blank detection doesn't work
         float edge[EDGE_PARTS] = {1,1,1,1,1,1}; // FIXME: change this if EDGE_PARTS is changed
@@ -3346,11 +3452,8 @@ make_thumbnail(char *file)
             edge_ip = rotate_gdImage(
                 detect_edge(pFrameRGB, &tn, edge, EDGE_FOUND),
                 tn.rotation);
-
         }
-        //av_log(NULL, AV_LOG_VERBOSE, "  idx: %d, evade_try: %d, blank: %.2f%s edge: %.3f %.3f %.3f %.3f %.3f %.3f%s\n",
-        //    idx, evade_try, blank, (blank > gb_b_blank) ? "**b**" : "",
-        //    edge[0], edge[1], edge[2], edge[3], edge[4], edge[5], is_edge(edge, EDGE_FOUND) ? "" : "**e**"); // DEBUG
+        
         if (evade_step > 0 && (blank > gb_b_blank || !is_edge(edge, EDGE_FOUND))) {
             idx--;
             evade_try++;
@@ -3367,7 +3470,14 @@ make_thumbnail(char *file)
             TIME_STR time_tmp;
             format_time(calc_time(seek_target, pStream->time_base, start_time), time_tmp, ':');
             av_log(NULL, AV_LOG_INFO, "  * blank %.2f or no edge * skipping shot at %s after %d tries\n", blank, time_tmp, evade_try);
-            thumb_nb--; // reduce # shots
+            
+            // Important: don't reduce thumb_nb if we're nearing the end of the file
+            // This ensures we still get a complete grid even with some skipped frames
+            if (seek_target + tn.step_t < pFormatCtx->duration * pStream->time_base.den / pStream->time_base.num / AV_TIME_BASE) {
+                thumb_nb--; // reduce # shots
+            } else {
+                av_log(NULL, AV_LOG_INFO, "  keeping grid size despite skipped shot (near end of file)\n");
+            }
             goto skip_shot;
         }
 
@@ -3381,6 +3491,8 @@ make_thumbnail(char *file)
             av_log(NULL, AV_LOG_ERROR, "  gdImageCreateTrueColor failed: width %d, height %d\n", tn.shot_width_in, tn.shot_height_in);
             goto cleanup;
         }
+        av_log(NULL, AV_LOG_INFO, "  Creating GD image: width %d, height %d (pFrameRGB: %dx%d, linesize: %d)\n", 
+       tn.shot_width_in, tn.shot_height_in, tn.shot_width_in, tn.shot_height_in, pFrameRGB->linesize[0]);
         FrameRGB_2_gdImage(pFrameRGB, ip, tn.shot_width_in, tn.shot_height_in);
         ip = rotate_gdImage(ip, tn.rotation);
 
