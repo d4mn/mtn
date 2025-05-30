@@ -1932,63 +1932,54 @@ double blank_frame(AVFrame *pFrame, int width, int height)
 uint64_t gb_video_pkt_pts = AV_NOPTS_VALUE;
 
 
-/**
- * Convert an error code into a text message.
- * @param error Error code to be converted
- * @return Corresponding error text (not thread-safe)
- */
-static const char *get_error_text(const int error)
-{
-    static char error_buffer[255];
-    av_strerror(error, error_buffer, sizeof(error_buffer));
-    return error_buffer;
-}
-
 int get_frame_from_packet(AVCodecContext *pCodecCtx,
                       AVPacket       *pkt,
                       AVFrame        *pFrame)
 {
     int fret;
 
+    // Basic packet validation
+    if (pkt && (pkt->size <= 0 || !pkt->data)) {
+        av_log(NULL, AV_LOG_WARNING, "Invalid packet data - skipping\n");
+        return AVERROR_INVALIDDATA;
+    }
+
     /// send packet for decoding
     fret = avcodec_send_packet(pCodecCtx, pkt);
 
-    // ignore invalid packets and continue
-    if(fret == AVERROR_INVALIDDATA ||
-       fret == -1 /* Operation not permitted */ ||
-       fret == AVERROR(EINVAL)) // Added EINVAL to handle invalid cu_qp_delta
-    {
-        av_log(NULL, AV_LOG_WARNING, "Invalid packet data (error %d: %s) - skipping packet\n", 
-               fret, av_err2str(fret));
-        return AVERROR(EAGAIN);
-    }
-
-    if (fret < 0) {
-        av_log(NULL, AV_LOG_ERROR, "Error sending a packet for decoding - %s\n", get_error_text(fret));
-        // Don't exit with error, just return the error code for higher-level handling
+    // Handle different error types appropriately
+    if (fret == AVERROR_INVALIDDATA) {
+        av_log(NULL, AV_LOG_WARNING, "Invalid packet data - skipping packet\n");
+        return AVERROR(EAGAIN);  // Signal to try next packet
+    } else if (fret == AVERROR(EINVAL)) {
+        av_log(NULL, AV_LOG_WARNING, "Invalid codec parameters - skipping packet\n");
+        return AVERROR(EAGAIN);  // Signal to try next packet
+    } else if (fret == AVERROR(EAGAIN)) {
+        // Decoder buffer full - this is normal, just need to receive frames first
+        av_log(NULL, AV_LOG_VERBOSE, "Decoder buffer full, need to receive frames first\n");
+        return fret;
+    } else if (fret < 0) {
+        av_log(NULL, AV_LOG_WARNING, "Error sending packet for decoding: %s\n", av_err2str(fret));
         return fret;
     }
 
+    // Try to receive frame
     fret = avcodec_receive_frame(pCodecCtx, pFrame);
 
-    if (fret == AVERROR(EAGAIN))
-        return fret;
-
-    if(fret == AVERROR_EOF)
-    {
+    if (fret == AVERROR(EAGAIN)) {
+        return fret;  // Need more packets
+    } else if (fret == AVERROR_EOF) {
         av_log(NULL, AV_LOG_INFO, "No more frames: received AVERROR_EOF\n");
         return -1;
-    }
-    if (fret == AVERROR(EINVAL))
-    {
-        av_log(NULL, AV_LOG_WARNING, "Codec not opened or invalid parameters: received AVERROR(EINVAL)\n");
+    } else if (fret == AVERROR(EINVAL)) {
+        av_log(NULL, AV_LOG_WARNING, "Codec not opened or invalid parameters\n");
         return -1;
-    }
-    if (fret < 0) {
-        av_log(NULL, AV_LOG_WARNING, "Error during decoding packet: %s\n", av_err2str(fret));
-        // Return error instead of exiting to allow continued processing
+    } else if (fret < 0) {
+        av_log(NULL, AV_LOG_WARNING, "Error during decoding: %s\n", av_err2str(fret));
         return fret;
     }
+
+    // Success
 #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(55, 34, 100)
     av_log(NULL, AV_LOG_VERBOSE, "Got picture from frame pts=%"PRId64"\n", pFrame->pts);
 #else
@@ -2026,8 +2017,10 @@ video_decode_next_frame(AVFormatContext *pFormatCtx,
     int got_picture = 0;
     int ret = 0;
     uint64_t pkt_without_pic = 0;
-    int decode_errors = 0;
-    const int max_decode_errors = 5;  // Allow multiple errors before giving up
+    int consecutive_decode_errors = 0;
+    const int max_consecutive_errors = 3;  // Reduced from 5
+    int total_decode_errors = 0;
+    const int max_total_errors = 10;  // Allow more total errors but fewer consecutive
 
     // Initialize packet on first call
     if (!pkt) {
@@ -2049,12 +2042,14 @@ video_decode_next_frame(AVFormatContext *pFormatCtx,
             if (ret == AVERROR_EOF) {
                 av_log(NULL, AV_LOG_VERBOSE, "av_read_frame returned EOF - end of file\n");
                 // Flush decoder at EOF to try to get the last frame
-                avcodec_send_packet(pCodecCtx, NULL);
-                ret = avcodec_receive_frame(pCodecCtx, pFrame);
-                if (ret == 0) {
-                    got_picture = 1;
-                    *pPts = pFrame->pts != AV_NOPTS_VALUE ? pFrame->pts : pFrame->pkt_dts;
-                    break;
+                ret = avcodec_send_packet(pCodecCtx, NULL);
+                if (ret >= 0) {
+                    ret = avcodec_receive_frame(pCodecCtx, pFrame);
+                    if (ret == 0) {
+                        got_picture = 1;
+                        *pPts = pFrame->pts != AV_NOPTS_VALUE ? pFrame->pts : pFrame->pkt_dts;
+                        break;
+                    }
                 }
                 return 0;  // EOF with no more frames
             } else {
@@ -2070,65 +2065,116 @@ video_decode_next_frame(AVFormatContext *pFormatCtx,
 
         pkt_without_pic++;
 
+        // Basic packet validation
+        if (pkt->size <= 0 || !pkt->data) {
+            av_log(NULL, AV_LOG_WARNING, "Invalid packet data (size=%d, data=%p) - skipping\n", 
+                   pkt->size, pkt->data);
+            continue;
+        }
+
         dump_packet(pkt, pStream);
 
-        // Save global pts to be stored in pFrame
+        // Save global pts
         av_log(NULL, AV_LOG_VERBOSE, "*saving gb_video_pkt_pts: %"PRId64"\n", pkt->pts);
         gb_video_pkt_pts = pkt->pts;
 
-        // Try to decode packet
+        // Try to send packet to decoder
         ret = avcodec_send_packet(pCodecCtx, pkt);
         
-        // Handle decode errors more gracefully
-        if (ret == AVERROR_INVALIDDATA) {
-            decode_errors++;
-            av_log(NULL, AV_LOG_WARNING, "Invalid data in packet at pts %"PRId64" (%s) - skipping\n", 
-                   pkt->pts, av_err2str(ret));
+        if (ret < 0) {
+            total_decode_errors++;
+            consecutive_decode_errors++;
             
-            if (decode_errors > max_decode_errors) {
-                av_log(NULL, AV_LOG_ERROR, "Too many decode errors (%d) - giving up\n", decode_errors);
-                return ret;
+            if (ret == AVERROR_INVALIDDATA || ret == AVERROR(EINVAL)) {
+                av_log(NULL, AV_LOG_WARNING, "Invalid packet data at pts %"PRId64" (%s) - skipping (consecutive: %d, total: %d)\n", 
+                       pkt->pts, av_err2str(ret), consecutive_decode_errors, total_decode_errors);
+            } else if (ret == AVERROR(EAGAIN)) {
+                // Decoder buffer is full, try to receive frames first
+                av_log(NULL, AV_LOG_VERBOSE, "Decoder buffer full, trying to receive frames\n");
+                
+                // Try to receive pending frames
+                while ((ret = avcodec_receive_frame(pCodecCtx, pFrame)) == 0) {
+                    got_picture = 1;
+                    *pPts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
+                    consecutive_decode_errors = 0;  // Reset on success
+                    break;
+                }
+                
+                if (got_picture) {
+                    break;
+                }
+                
+                // If still EAGAIN, try sending the packet again
+                ret = avcodec_send_packet(pCodecCtx, pkt);
+                if (ret < 0) {
+                    av_log(NULL, AV_LOG_WARNING, "Still cannot send packet after receiving frames: %s\n", av_err2str(ret));
+                    consecutive_decode_errors++;
+                }
+            } else {
+                av_log(NULL, AV_LOG_WARNING, "Error sending packet to decoder: %s (consecutive: %d, total: %d)\n", 
+                       av_err2str(ret), consecutive_decode_errors, total_decode_errors);
             }
-            continue;  // Try next packet
-        } else if (ret < 0 && ret != AVERROR(EAGAIN)) {
-            av_log(NULL, AV_LOG_INFO, "Error sending packet to decoder: %s\n", av_err2str(ret));
-            decode_errors++;
             
-            if (decode_errors > max_decode_errors) {
-                av_log(NULL, AV_LOG_ERROR, "Too many decode errors (%d) - giving up\n", decode_errors);
-                return ret;
+            // If too many consecutive errors, flush decoder and reset
+            if (consecutive_decode_errors >= max_consecutive_errors) {
+                av_log(NULL, AV_LOG_WARNING, "Too many consecutive decode errors (%d), flushing decoder\n", 
+                       consecutive_decode_errors);
+                avcodec_flush_buffers(pCodecCtx);
+                consecutive_decode_errors = 0;  // Reset after flush
+                
+                // If total errors are also too high, give up
+                if (total_decode_errors >= max_total_errors) {
+                    av_log(NULL, AV_LOG_ERROR, "Too many total decode errors (%d) - giving up\n", total_decode_errors);
+                    return AVERROR_INVALIDDATA;
+                }
             }
+            
             continue;  // Try next packet
         }
 
-        // Receive decoded frame
+        // Successfully sent packet, now try to receive frame
         ret = avcodec_receive_frame(pCodecCtx, pFrame);
         
-        if (ret == AVERROR(EAGAIN)) {
+        if (ret == 0) {
+            // Successfully decoded a frame
+            got_picture = 1;
+            *pPts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
+            consecutive_decode_errors = 0;  // Reset on success
+            break;
+            
+        } else if (ret == AVERROR(EAGAIN)) {
             // Need more packets
-            if (pkt_without_pic % 50 == 0)
+            if (pkt_without_pic % 50 == 0) {
                 av_log(NULL, AV_LOG_INFO, "  no picture in %"PRId64" packets\n", pkt_without_pic);
+            }
             
             if (pkt_without_pic >= MAX_PACKETS_WITHOUT_PICTURE) {
                 av_log(NULL, AV_LOG_ERROR, "  giving up after %"PRId64" packets without a picture\n", pkt_without_pic);
                 return AVERROR(EAGAIN);
             }
+            // Reset consecutive errors on EAGAIN since packet was accepted
+            consecutive_decode_errors = 0;
             continue;
-        } else if (ret < 0) {
-            // Error during frame decoding
-            decode_errors++;
-            av_log(NULL, AV_LOG_WARNING, "Error receiving frame: %s - skipping\n", av_err2str(ret));
             
-            if (decode_errors > max_decode_errors) {
-                av_log(NULL, AV_LOG_ERROR, "Too many decode errors (%d) - giving up\n", decode_errors);
-                return ret;
+        } else {
+            // Error during frame decoding
+            total_decode_errors++;
+            consecutive_decode_errors++;
+            av_log(NULL, AV_LOG_WARNING, "Error receiving frame: %s (consecutive: %d, total: %d)\n", 
+                   av_err2str(ret), consecutive_decode_errors, total_decode_errors);
+            
+            if (consecutive_decode_errors >= max_consecutive_errors) {
+                av_log(NULL, AV_LOG_WARNING, "Too many consecutive receive errors, flushing decoder\n");
+                avcodec_flush_buffers(pCodecCtx);
+                consecutive_decode_errors = 0;
+                
+                if (total_decode_errors >= max_total_errors) {
+                    av_log(NULL, AV_LOG_ERROR, "Too many total decode errors (%d) - giving up\n", total_decode_errors);
+                    return ret;
+                }
             }
             continue;  // Try next packet
         }
-        
-        // Successfully decoded a frame
-        got_picture = 1;
-        *pPts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
     }
 
     dump_stream(pStream);
@@ -3317,7 +3363,7 @@ make_thumbnail(char *file)
             // usually movies have key frames every 10 s
             && (tn.step_t < (15/tn.time_base))  // Keep this check for small step sizes
             && (found_diff <= -2*tn.step_t || found_diff >= 2*tn.step_t)  // Make threshold bigger
-            && (abs(found_diff * tn.time_base) > 30.0)) {  // Only if off by >30 seconds
+            && (fabs(found_diff * tn.time_base) > 30.0)) {  // Only if off by >30 seconds
 
             // compute the approx. time it take for the non-seek mode, if too long print a msg instead
             double shot_dtime;
