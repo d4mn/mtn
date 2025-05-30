@@ -42,6 +42,16 @@ ifeq ($(ENABLE_AVIF),1)
     CFLAGS+=-DMTN_WITH_AVIF
 endif
 
+# Add this to detect AVIF support in GD
+AVIF_CHECK := $(shell echo '\#include <gd.h>' | $(CC) -E -I/usr/include - 2>/dev/null | grep -q 'gdImageAvif' && echo "yes" || echo "no")
+
+ifeq ($(AVIF_CHECK),yes)
+    CFLAGS += -DMTN_WITH_AVIF -DHAVE_LIBGD_AVIF
+else
+    # Remove AVIF flag if not supported
+    CFLAGS := $(filter-out -DMTN_WITH_AVIF,$(CFLAGS))
+endif
+
 LIBS+=-lavcodec -lavformat -lavcodec -lswscale -lavutil -lavfilter -lgd -lm
 S_INCPATH=-I$(LIBSDIR)/FFmpeg -I$(LIBSDIR)/libgd/src
 S_LIBS= -static-libgcc \
