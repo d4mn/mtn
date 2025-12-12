@@ -2928,7 +2928,17 @@ make_thumbnail(char *file)
     // decoding a frame, e.g. Dragonball Z 001 (720x480 H264 AAC).mkv
     AVRational sample_aspect_ratio = av_guess_sample_aspect_ratio(pFormatCtx, pStream, NULL);
 
-    double duration = (double) pFormatCtx->duration / AV_TIME_BASE; // can be unknown & can be incorrect (e.g. .vob files)
+    // Prefer video stream duration over container duration
+    // Container duration may include longer audio tracks, causing seeks beyond video end
+    double duration = -1;
+    if (pStream->duration != AV_NOPTS_VALUE && pStream->duration > 0) {
+        duration = pStream->duration * av_q2d(pStream->time_base);
+        av_log(NULL, AV_LOG_VERBOSE, "  using video stream duration: %.2f s\n", duration);
+    }
+    if (duration <= 0) {
+        duration = (double) pFormatCtx->duration / AV_TIME_BASE; // can be unknown & can be incorrect (e.g. .vob files)
+        av_log(NULL, AV_LOG_VERBOSE, "  using container duration: %.2f s\n", duration);
+    }
     if (duration <= 0) {
         duration = guess_duration(pFormatCtx, video_index, pCodecCtx, pFrame);
     }
@@ -2954,6 +2964,7 @@ make_thumbnail(char *file)
     }
     int64_t start_time_tb = start_time * pStream->time_base.den / pStream->time_base.num; // in time_base unit
     //av_log(NULL, AV_LOG_ERROR, "  start_time_tb: %"PRId64"\n", start_time_tb);
+    int64_t duration_tb = duration / av_q2d(pStream->time_base); // duration in time_base unit
 
     // decode the first frame without seeking.
     // without doing this, avcodec_decode_video wont be able to decode any picture
@@ -3519,7 +3530,7 @@ make_thumbnail(char *file)
             
             // Important: don't reduce thumb_nb if we're nearing the end of the file
             // This ensures we still get a complete grid even with some skipped frames
-            if (seek_target + tn.step_t < pFormatCtx->duration * pStream->time_base.den / pStream->time_base.num / AV_TIME_BASE) {
+            if (seek_target + tn.step_t < duration_tb) {
                 thumb_nb--; // reduce # shots
             } else {
                 av_log(NULL, AV_LOG_INFO, "  keeping grid size despite skipped shot (near end of file)\n");
