@@ -890,6 +890,11 @@ return 0 if image is saved
 */
 int save_image(gdImagePtr ip, char *outname)
 {
+    if (ip == NULL) {
+        av_log(NULL, AV_LOG_ERROR, "\n%s: cannot save image '%s': image pointer is NULL\n", gb_argv0, outname);
+        return -1;
+    }
+
 #if defined(WIN32) && defined(_UNICODE)
     wchar_t outname_w[FILENAME_MAX];
     UTF8_2_WC(outname_w, outname, FILENAME_MAX);
@@ -3650,6 +3655,12 @@ make_thumbnail(char *file)
     }
 
   eof: ;
+    /* check if we have any thumbnails to save */
+    if (idx == 0 || tn.column <= 0 || tn.row <= 0 || tn.out_ip == NULL) {
+        av_log(NULL, AV_LOG_ERROR, "  no thumbnails created (idx=%d, column=%d, row=%d)\n", idx, tn.column, tn.row);
+        goto cleanup;
+    }
+
     /* crop if we dont get enough shots */
     int cropp_needed = 0;
     const int created_rows = ceil((double)idx / tn.column);
