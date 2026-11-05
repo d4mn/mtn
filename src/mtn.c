@@ -3569,7 +3569,12 @@ make_thumbnail(char *file)
                 av_log(NULL, AV_LOG_ERROR, "Error while feeding the filtergraph\n");
         }
 
+#if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(60, 2, 0)
         av_log(NULL, AV_LOG_INFO, "Frame number: %d, Width: %d, Height: %d\n", pCodecCtx->frame_number, pCodecCtx->width, pCodecCtx->height);
+#else
+        // frame_number was replaced by frame_num in FFmpeg 6.0 and removed in FFmpeg 7.0
+        av_log(NULL, AV_LOG_INFO, "Frame number: %"PRId64", Width: %d, Height: %d\n", pCodecCtx->frame_num, pCodecCtx->width, pCodecCtx->height);
+#endif
         av_log(NULL, AV_LOG_INFO, "Input linesize: %d\n", pFrame->linesize[0]);
         av_log(NULL, AV_LOG_INFO, "Output linesize: %d\n", pFrameRGB->linesize[0]);
 
