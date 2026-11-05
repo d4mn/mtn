@@ -2049,7 +2049,10 @@ video_decode_next_frame(AVFormatContext *pFormatCtx,
     int consecutive_decode_errors = 0;
     const int max_consecutive_errors = 3;  // Reduced from 5
     int total_decode_errors = 0;
-    const int max_total_errors = 10;  // Allow more total errors but fewer consecutive
+    // A corrupt stretch of a live recording can produce hundreds of bad packets
+    // before the next good key frame; the packet budget (MAX_PACKETS_WITHOUT_PICTURE)
+    // bounds the work, so the error budget only needs to catch hopeless cases.
+    const int max_total_errors = 200;
 
     // Initialize packet on first call
     if (!pkt) {
@@ -2327,6 +2330,16 @@ int really_seek(AVFormatContext *pFormatCtx, int index, int64_t timestamp, int f
         return ret;
     }
 
+    /* a forward seek fails when there is no key frame at or after the target
+       (target past the last key frame, very short files); land on the one before it */
+    if (!(flags & AVSEEK_FLAG_BACKWARD)) {
+        ret = av_seek_frame(pFormatCtx, index, timestamp, AVSEEK_FLAG_BACKWARD);
+        if (ret >= 0) {
+            av_log(NULL, AV_LOG_VERBOSE, "AVSEEK_FLAG_BACKWARD: timestamp: %"PRId64"\n", timestamp);
+            return ret;
+        }
+    }
+
     /* then we try seeking to any (non key) frame AVSEEK_FLAG_ANY */
     ret = av_seek_frame(pFormatCtx, index, timestamp, flags | AVSEEK_FLAG_ANY);
     if (ret >= 0) { // success
@@ -2553,7 +2566,7 @@ calculate_thumbnail(
         int req_rows,
         int src_width,
         int src_height,
-        int duration,
+        double duration,
         thumbnail *tn
 )
 {
@@ -2605,7 +2618,7 @@ reduce_shots_to_fit_in(
     int req_cols,
     int src_width,
     int src_height,
-    int duration,
+    double duration,
     thumbnail *tn
 )
 {
@@ -2638,7 +2651,7 @@ reduce_shots_to_fit_in(
         tn->column > 0 &&
         tn->row > 1)
     {
-        int reduced_rows = (int)((double)(duration-1) /(double)reduced_columns);
+        int reduced_rows = (int)((duration-1) /(double)reduced_columns);
 
         if(reduced_rows == 0)
             reduced_rows = 1;
@@ -2689,6 +2702,7 @@ make_thumbnail(char *file)
     AVCodecContext *pCodecCtx = NULL;
     int previous_height = 0;
     int previous_width = 0;
+    int previous_format = -1;
     AVFrame *pFrame = NULL;
     AVFrame *pFrameRGB = NULL;
     uint8_t *rgb_buffer = NULL;
@@ -3013,6 +3027,36 @@ make_thumbnail(char *file)
     int64_t found_pts = -1;
     int64_t first_pts = -1; // pts of first frame
     ret = video_decode_next_frame(pFormatCtx, pCodecCtx, pFrame, video_index, &first_pts);
+    if (ret < 0) {
+        /*
+         * The beginning of the file can be undecodable (missing parameter sets,
+         * corrupt segments of a live recording) while the rest is fine. Probe
+         * further into the file before giving up on the whole thing.
+         */
+        static const double probe_fractions[] = {0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9};
+        unsigned int pi;
+        for (pi = 0; pi < sizeof(probe_fractions)/sizeof(probe_fractions[0]); pi++) {
+            int64_t probe_target = start_time_tb + (int64_t)(duration_tb * probe_fractions[pi]);
+            av_log(NULL, AV_LOG_INFO, "  first frame cannot be decoded; probing at %.1f s\n",
+                calc_time(probe_target, pStream->time_base, start_time));
+            if (av_seek_frame(pFormatCtx, video_index, probe_target, 0) < 0
+                && av_seek_frame(pFormatCtx, video_index, probe_target, AVSEEK_FLAG_BACKWARD) < 0) {
+                continue;
+            }
+            avcodec_flush_buffers(pCodecCtx);
+            ret = video_decode_next_frame(pFormatCtx, pCodecCtx, pFrame, video_index, &first_pts);
+            if (ret >= 0) {
+                break;
+            }
+        }
+        if (ret > 0) {
+            av_log(NULL, AV_LOG_INFO, "  first decodable frame found at %.1f s; shots before it will be skipped\n",
+                calc_time(first_pts, pStream->time_base, start_time));
+            // back to the start so that the shot loop behaves as usual
+            av_seek_frame(pFormatCtx, video_index, start_time_tb, AVSEEK_FLAG_BACKWARD);
+            avcodec_flush_buffers(pCodecCtx);
+        }
+    }
     if (0 == ret) { // end of file
         goto eof;
     } else if (ret < 0) { // error
@@ -3578,11 +3622,30 @@ make_thumbnail(char *file)
         av_log(NULL, AV_LOG_INFO, "Input linesize: %d\n", pFrame->linesize[0]);
         av_log(NULL, AV_LOG_INFO, "Output linesize: %d\n", pFrameRGB->linesize[0]);
 
-        if (pCodecCtx->width != previous_width || pCodecCtx->height != previous_height) {
+        /*
+         * Scale using the geometry of the frame we actually got, not the codec
+         * context's. Streams can change resolution mid-way (live recordings do),
+         * and because of decoder delay pCodecCtx already describes the new SPS
+         * while the frame being emitted still has the old size. Using the
+         * context's height here made sws_scale read past the end of the smaller
+         * frame buffer (segfault).
+         */
+        if (pFrame->width <= 0 || pFrame->height <= 0 || pFrame->format < 0) {
+            av_log(NULL, AV_LOG_ERROR, "  decoded frame has no geometry (%dx%d, format %d) - skipping shot\n",
+                pFrame->width, pFrame->height, pFrame->format);
+            idx--;
+            thumb_nb--;
+            goto skip_shot;
+        }
+        if (pFrame->width != pCodecCtx->width || pFrame->height != pCodecCtx->height) {
+            av_log(NULL, AV_LOG_INFO, "  frame size %dx%d differs from codec context %dx%d (resolution change)\n",
+                pFrame->width, pFrame->height, pCodecCtx->width, pCodecCtx->height);
+        }
+        if (pFrame->width != previous_width || pFrame->height != previous_height || pFrame->format != previous_format) {
             sws_freeContext(pSwsCtx);  // Free the previous context
 
             // Reinitialize the sws context with the new frame size
-            pSwsCtx = sws_getContext(pCodecCtx->width, pCodecCtx->height, pCodecCtx->pix_fmt,
+            pSwsCtx = sws_getContext(pFrame->width, pFrame->height, pFrame->format,
                 tn.shot_width_in, tn.shot_height_in, AV_PIX_FMT_RGB24, SWS_BILINEAR, NULL, NULL, NULL);
 
             if (!pSwsCtx) {
@@ -3591,12 +3654,13 @@ make_thumbnail(char *file)
             }
 
             // Update the stored frame dimensions
-            previous_width = pCodecCtx->width;
-            previous_height = pCodecCtx->height;
+            previous_width = pFrame->width;
+            previous_height = pFrame->height;
+            previous_format = pFrame->format;
         }
 
         /* convert to AV_PIX_FMT_RGB24 & resize */
-        int height_of_the_output_slice = sws_scale(pSwsCtx, (const uint8_t* const*)pFrame->data, pFrame->linesize, 0, pCodecCtx->height,
+        int height_of_the_output_slice = sws_scale(pSwsCtx, (const uint8_t* const*)pFrame->data, pFrame->linesize, 0, pFrame->height,
             pFrameRGB->data, pFrameRGB->linesize);
         if(height_of_the_output_slice <= 0)
         {
@@ -3757,15 +3821,19 @@ make_thumbnail(char *file)
     }
     av_log(NULL, AV_LOG_VERBOSE, "  *** avg_evade_try: %.2f\n", avg_evade_try); // DEBUG
 
-    sprite_flush(sprite);
-    sprite_export_vtt(sprite);
-
     if (gb_I_individual_ignore_grid) {
+        sprite_flush(sprite);
+        sprite_export_vtt(sprite);
         return_code = 0;
         goto cleanup;
     }
 
   eof: ;
+    // also reached via 'goto eof' from the shot loop (EOF, failed seek):
+    // write out whatever sprites we have, otherwise the sheets exist without a .vtt
+    sprite_flush(sprite);
+    sprite_export_vtt(sprite);
+
     /* check if we have any thumbnails to save */
     if (idx == 0 || tn.column <= 0 || tn.row <= 0 || tn.out_ip == NULL) {
         av_log(NULL, AV_LOG_ERROR, "  no thumbnails created (idx=%d, column=%d, row=%d)\n", idx, tn.column, tn.row);
